@@ -352,6 +352,13 @@ func step(u *Unit, zigzag bool) {
 		shoot()
 		return
 	}
+	// Ally ahead: step aside instead of queuing up.
+	if what == "ally" && dist == 1 {
+		u.detourDir = (want + 1 + 2*(my_id()%2)) % 4
+		u.detour = 2 + my_id()%3
+		turnTo(u.detourDir)
+		return
+	}
 	if move_forward() {
 		u.moves++
 		u.horiz = want == Left || want == Right
@@ -465,6 +472,28 @@ func dmHold(u *Unit) {
 	// Already facing out: idle this tick (look already done). Saves CPU.
 }
 
+// Per-unit offset so the squad does not stack on one cell.
+func packOffset() (int, int) {
+	id := my_id()
+	lane := id % 5
+	// -2,-1,0,1,2 along one axis; alternate axis by id.
+	off := lane - 2
+	if lane%2 == 0 {
+		return off * 2, 0
+	}
+	return 0, off * 2
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
 func hunt(u *Unit) {
 	if holding() {
 		dmHold(u)
@@ -472,20 +501,29 @@ func hunt(u *Unit) {
 	}
 	x, y := get_pos()
 	g := get_grid_size()
-	// Chase last known contact first.
+	ox, oy := packOffset()
+	// Chase last known contact on a private offset — not the same tile.
 	if enemyAge > 0 && tick-enemyAge < 120 {
-		if u.tx != enemyX || u.ty != enemyY || u.budget <= 0 {
-			target(u, enemyX, enemyY)
+		tx := clamp(enemyX+ox, 1, g-2)
+		ty := clamp(enemyY+oy, 1, g-2)
+		if u.tx != tx || u.ty != ty || u.budget <= 0 {
+			target(u, tx, ty)
 		}
 		step(u, false)
 		return
 	}
 	if u.budget <= 0 || near(u) {
 		if u.phase == 0 {
-			target(u, g-1-x, g-1-y)
+			// Mirror spawn on separate lanes toward the enemy half.
+			tx := clamp(g-1-x+ox, 1, g-2)
+			ty := clamp(g-1-y+oy, 1, g-2)
+			target(u, tx, ty)
 			u.phase = 1
 		} else {
-			target(u, 2+randInt(g-4), 2+randInt(g-4))
+			// Roam: base random + stable lane bias so paths diverge.
+			tx := clamp(2+randInt(g-4)+ox, 1, g-2)
+			ty := clamp(2+randInt(g-4)+oy, 1, g-2)
+			target(u, tx, ty)
 		}
 	}
 	if u.moves >= 5 {
