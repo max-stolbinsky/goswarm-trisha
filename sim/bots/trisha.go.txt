@@ -38,7 +38,7 @@ var dx = [4]int{0, 1, 0, -1}
 var dy = [4]int{-1, 0, 1, 0}
 
 const (
-	dmHoldTicks  = 280 // Starter leaves at 400; 900 was camping to death (sweep pick)
+	dmHoldTicks  = 400 // match Starter; 280 walked into still-holding camps, 900 never left
 	droneShotMax = 4   // cover the flag box, then rely on foot search
 	ctfGuards    = 1    // one approach guard (sweep: best overall with rear walls)
 	ctfRearWalls = true // seal rear sides after army is full
@@ -201,6 +201,11 @@ func radarSnap(u *Unit) bool {
 	}
 	if wr == "enemy" || wr == "bullet" || wr == "flag" || wr == "enemy_flag" {
 		noteSide(wr, dr, false)
+	}
+	// DM duel: only record side contacts — turning here fights duel facing
+	// and parks the last warrior on one tile for hundreds of ticks.
+	if endgame {
+		return false
 	}
 	if my_kind() != "builder" {
 		if wl == "enemy" {
@@ -517,9 +522,9 @@ func holding() bool {
 	if alarm {
 		return false
 	}
-	// Stagger breakout so the pack does not leave as one blob.
-	leave := dmHoldTicks + (my_id()%5)*25
-	return tick < leave
+	// Break with Starter (~400), then stagger so the pack does not pour
+	// through one corridor into a knife-fight (xwHYgu8gDc).
+	return tick < dmHoldTicks+(my_id()%5)*18
 }
 
 func dmHold(u *Unit) {
@@ -535,10 +540,17 @@ func dmHold(u *Unit) {
 	}
 }
 
-// Per-unit offset on a 2D grid so hunters fan out.
+// Per-unit offset: five wide lanes so chase/roam targets stay apart.
 func packOffset() (int, int) {
-	lane := my_id() % 5
-	return (lane%3 - 1) * 3, (lane/3 - 1) * 3 // roughly -3..3 on both axes
+	offs := [5][2]int{
+		{-8, -3},
+		{-4, 6},
+		{0, -6},
+		{4, 3},
+		{8, -1},
+	}
+	o := offs[my_id()%5]
+	return o[0], o[1]
 }
 
 func clamp(v, lo, hi int) int {
@@ -592,10 +604,22 @@ func hunt(u *Unit) {
 		return
 	}
 
-	// Short chase window; offsets stay inland so we don't pin to the rim.
+	// Chase from different angles: odd lanes lock X first, even lock Y.
 	if enemyAge > 0 && tick-enemyAge < 50 && u.stuck < 3 {
-		tx := inland(enemyX + ox)
-		ty := inland(enemyY + oy)
+		tx, ty := inland(enemyX+ox), inland(enemyY+oy)
+		if my_id()%2 == 0 {
+			tx = inland(enemyX + ox)
+			ty = inland(y + (oy / 2))
+			if abs(x-enemyX) <= 2 {
+				ty = inland(enemyY + oy)
+			}
+		} else {
+			tx = inland(x + (ox / 2))
+			ty = inland(enemyY + oy)
+			if abs(y-enemyY) <= 2 {
+				tx = inland(enemyX + ox)
+			}
+		}
 		if u.tx != tx || u.ty != ty || u.budget <= 0 {
 			target(u, tx, ty)
 		}
@@ -604,8 +628,9 @@ func hunt(u *Unit) {
 	}
 	if u.budget <= 0 || near(u) {
 		if u.phase == 0 {
-			tx := inland(g - 1 - x + ox)
-			ty := inland(g - 1 - y + oy)
+			// Mirror push on private lanes — not five units on one diagonal.
+			tx := inland(g - 1 - x + ox*2)
+			ty := inland(g - 1 - y + oy*2)
 			target(u, tx, ty)
 			u.phase = 1
 		} else {
@@ -637,8 +662,10 @@ func duel(u *Unit) {
 	age := tick - enemyAge
 	lane := my_id() % 2
 
-	// Already on a firing line: face the last-known cell (shoot happens in loop).
-	if x == ex || y == ey {
+	// Stale "aligned" camp (replay 6qv3JDmZgk: 391 ticks on one cell) — leave the
+	// lane and sweep a ring around last-known instead of staring down an empty row.
+	staleLine := age > 40 && (x == ex || y == ey)
+	if (x == ex || y == ey) && !staleLine {
 		want := get_dir()
 		if y == ey {
 			if ex > x {
@@ -657,22 +684,25 @@ func duel(u *Unit) {
 			turnTo(want)
 			return
 		}
-		// Close in; with a shield we can contest the lane, without — still advance
-		// but step() will dodge bullets via the shared loop.
 		if x != ex || y != ey {
 			tx, ty := clamp(ex, 1, g-2), clamp(ey, 1, g-2)
 			if u.tx != tx || u.ty != ty || u.budget <= 0 {
 				targetAt(u, tx, ty)
 			}
 			step(u, false)
+		} else {
+			// Last-known is under us: take a step along the lane and reacquire.
+			u.detourDir = want
+			u.detour = 2
+			step(u, false)
 		}
 		return
 	}
 
-	// Not aligned: 2v1 pincer (one locks X, one locks Y); 1v1 picks nearer axis.
+	// Not aligned (or stale line): 2v1 pincer / 1v1 nearer axis, then ring.
 	var tx, ty int
 	two := my_units() >= 2
-	if two && lane == 0 || !two && abs(x-ex) <= abs(y-ey) {
+	if (two && lane == 0) || (!two && abs(x-ex) <= abs(y-ey)) {
 		if x != ex {
 			tx, ty = ex, y
 		} else {
@@ -685,13 +715,12 @@ func duel(u *Unit) {
 			tx, ty = ex, ey
 		}
 	}
-	// Stale contact: expand a ring around last-known instead of map-wide roam.
-	if age > 60 {
-		ring := 2 + ((age-60)/8)%7
+	if age > 40 {
+		ring := 2 + ((age-40)/6)%8
 		if lane == 0 {
-			tx, ty = ex+ring, ey
+			tx, ty = ex+ring*(1-2*(tick%2)), ey
 		} else {
-			tx, ty = ex, ey+ring
+			tx, ty = ex, ey+ring*(1-2*(tick%2))
 		}
 	}
 	tx, ty = clamp(tx, 1, g-2), clamp(ty, 1, g-2)
