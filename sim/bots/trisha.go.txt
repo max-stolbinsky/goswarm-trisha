@@ -12,6 +12,7 @@ const (
 type Unit struct {
 	tx, ty, budget, phase int
 	moves, scan, dodge    int
+	detour, detourDir     int
 	horiz                 bool
 }
 
@@ -23,10 +24,14 @@ var flagX, flagY int
 var modsReady bool
 var hasRadar, hasDrone, hasShield bool
 var droneDone bool // one drone launch attempt this ready-window
+var droneShot int  // how many launches this game (cap)
 var dx = [4]int{0, 1, 0, -1}
 var dy = [4]int{-1, 0, 1, 0}
 
-const dmHoldTicks = 1400
+const (
+	dmHoldTicks  = 1400
+	droneShotMax = 4 // cover the flag box, then rely on foot search
+)
 
 func abs(v int) int {
 	if v < 0 {
@@ -88,33 +93,74 @@ func markCell(x, y int) {
 	}
 }
 
-// Drone: only until flag found; scan 9×9 only for flag/enemy labels (no full paint).
-func maybeDrone() {
-	if !hasDrone || flagKnown || drone_ready() != 0 {
-		return
-	}
-	if droneDone {
-		return
-	}
-	droneDone = true
+func flagBox() (lo, hi int) {
 	g := get_grid_size()
-	cx, cy := g/2, g/2
 	if game_mode() == "ctf" {
 		home := g / 4
 		if home > 8 {
 			home = 8
 		}
 		fx, _ := my_flag()
-		lo, hi := g-2-home, g-3
+		lo, hi = g-2-home, g-3
 		if fx >= g/2 {
 			lo, hi = 2, 1+home
 		}
-		cx, cy = (lo+hi)/2, (lo+hi)/2
+		return
 	}
+	// Classic: flag is in the center 10×10.
+	lo, hi = g/2-5, g/2+4
+	if lo < 0 {
+		lo = 0
+	}
+	if hi >= g {
+		hi = g - 1
+	}
+	return
+}
+
+// droneAim: walk a few points so 9×9 shots cover the whole flag box
+// (a single center shot misses the rim — e.g. flag at 15,15 vs aim 20,20).
+func droneAim() (int, int) {
+	lo, hi := flagBox()
+	// 9×9 covers ±4; two offset centers span a 10×10 box.
+	points := [4][2]int{
+		{lo + 4, lo + 4},
+		{hi - 4, lo + 4},
+		{lo + 4, hi - 4},
+		{hi - 4, hi - 4},
+	}
+	i := droneShot % 4
+	cx, cy := points[i][0], points[i][1]
+	if cx < lo {
+		cx = lo
+	}
+	if cy < lo {
+		cy = lo
+	}
+	if cx > hi {
+		cx = hi
+	}
+	if cy > hi {
+		cy = hi
+	}
+	return cx, cy
+}
+
+// Drone: sparse scouting of the flag box; stop after a few shots or when found.
+func maybeDrone() {
+	if !hasDrone || flagKnown || droneShot >= droneShotMax || drone_ready() != 0 {
+		return
+	}
+	if droneDone {
+		return
+	}
+	droneDone = true
+	cx, cy := droneAim()
 	cells, ok := drone(cx, cy)
 	if !ok {
 		return
 	}
+	droneShot++
 	for r := 0; r < len(cells) && r < 9; r++ {
 		row := cells[r]
 		for c := 0; c < len(row) && c < 9; c++ {
@@ -195,16 +241,22 @@ func toward(ddx, ddy int, horiz bool) int {
 	return Up
 }
 
-// Starter-like step: no visit maps, one look when facing target.
+// Starter-like step with a short detour so a wall on a straight line
+// cannot soft-lock the unit (flip horiz alone does nothing when dy==0).
 func step(u *Unit, zigzag bool) {
 	u.budget--
 	x, y := get_pos()
 	ddx, ddy := u.tx-x, u.ty-y
-	horiz := abs(ddx) >= abs(ddy)
-	if zigzag && ddx != 0 && ddy != 0 {
-		horiz = !u.horiz
+	want := u.detourDir
+	if u.detour > 0 {
+		u.detour--
+	} else {
+		horiz := abs(ddx) >= abs(ddy)
+		if zigzag && ddx != 0 && ddy != 0 {
+			horiz = !u.horiz
+		}
+		want = toward(ddx, ddy, horiz)
 	}
-	want := toward(ddx, ddy, horiz)
 	if get_dir() != want {
 		turnTo(want)
 		return
@@ -225,6 +277,13 @@ func step(u *Unit, zigzag bool) {
 		markHere()
 		return
 	}
+	// Blocked: peel off along the other axis for a few ticks.
+	altHoriz := want == Up || want == Down
+	u.detourDir = toward(ddx, ddy, altHoriz)
+	if u.detourDir == want || randInt(4) == 0 {
+		u.detourDir = (want + 1 + 2*randInt(2)) % 4
+	}
+	u.detour = 2 + randInt(4)
 	u.horiz = !u.horiz
 }
 
@@ -255,8 +314,6 @@ func pickUnseen(u *Unit, lo, hi int) {
 }
 
 func search(u *Unit) {
-	x, y := get_pos()
-	g := get_grid_size()
 	if flagKnown {
 		if u.tx != flagX || u.ty != flagY {
 			target(u, flagX, flagY)
@@ -264,28 +321,42 @@ func search(u *Unit) {
 		step(u, false)
 		return
 	}
-	lo, hi := g/2-5, g/2+4
-	if lo < 0 {
-		lo = 0
-	}
-	if hi >= g {
-		hi = g - 1
-	}
-	if game_mode() == "ctf" {
-		home := g / 4
-		if home > 8 {
-			home = 8
+	lo, hi := flagBox()
+	x, y := get_pos()
+	// Starter-style box sweep: nearest corner → zigzag to opposite → roam.
+	switch u.phase {
+	case 0:
+		cx, cy := lo, lo
+		if abs(x-hi) < abs(x-lo) {
+			cx = hi
 		}
-		fx, _ := my_flag()
-		lo, hi = g-2-home, g-3
-		if fx >= g/2 {
-			lo, hi = 2, 1+home
+		if abs(y-hi) < abs(y-lo) {
+			cy = hi
+		}
+		target(u, cx, cy)
+		u.phase = 1
+	case 1:
+		if near(u) || u.budget <= 0 {
+			target(u, lo+hi-u.tx, lo+hi-u.ty)
+			u.phase = 2
+		}
+	case 2:
+		if near(u) || u.budget <= 0 {
+			u.phase = 3
+		}
+	default:
+		need := near(u) || u.budget <= 0
+		if !need && u.tx >= 0 && u.ty >= 0 && u.tx < 40 && u.ty < 40 && seen[u.ty][u.tx] {
+			need = true
+		}
+		if need {
+			pickUnseen(u, lo, hi)
+			u.scan = 3
+			turn_right()
+			return
 		}
 	}
-	if u.budget <= 0 || (x == u.tx && y == u.ty) {
-		pickUnseen(u, lo, hi)
-	}
-	if u.moves >= 8 {
+	if u.phase != 2 && u.moves >= 8 {
 		u.moves = 0
 		u.scan = 3
 		turn_right()
@@ -399,12 +470,18 @@ func loop() {
 		hunt(u)
 		return
 	}
-	// Mark stood cell cheaply for search coverage.
+	// Light coverage for the flag box (bounded — not a full map paint).
 	markHere()
 	if dist >= 1 {
 		x, y := get_pos()
 		d := get_dir()
-		markCell(x+dx[d]*dist, y+dy[d]*dist)
+		lim := dist
+		if lim > 8 {
+			lim = 8
+		}
+		for i := 1; i <= lim; i++ {
+			markCell(x+dx[d]*i, y+dy[d]*i)
+		}
 	}
 	search(u)
 }
