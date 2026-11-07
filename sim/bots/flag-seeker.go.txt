@@ -1,0 +1,38 @@
+// Explores, and every few moves looks around (one turn per tick) for the
+// flag; drives straight at it when it sees it and shoots enemies nearby.
+var moves int    // moves since the last look-around
+var scanning int // turns left in the current look-around
+
+func loop() {
+	what, dist := look_forward()
+	if what == "flag" {
+		scanning = 0
+		move_forward()
+		return
+	}
+	if what == "enemy" && dist < 8 {
+		shoot()
+		return
+	}
+	if scanning > 0 {
+		scanning--
+		turn_right()
+		return
+	}
+	if moves >= 6 {
+		// Four right turns: look in every direction, end up facing forward.
+		moves = 0
+		scanning = 3
+		turn_right()
+		return
+	}
+	if dist > 1 && move_forward() {
+		moves++
+		return
+	}
+	if randInt(2) == 0 {
+		turn_left()
+	} else {
+		turn_right()
+	}
+}

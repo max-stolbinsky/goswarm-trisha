@@ -1,0 +1,49 @@
+// A team bot: warriors sweep the map, look around every few moves and shoot
+// enemies in sight; in capture the flag they charge the enemy flag. Builders
+// keep building warriors.
+var moves = map[int]int{} // per unit: moves since the last look-around
+var scan = map[int]int{}  // per unit: turns left in the current look-around
+
+func loop() {
+	id := my_id()
+	if my_kind() == "builder" {
+		if busy() == 0 && !build_warrior() {
+			turn_right()
+		}
+		return
+	}
+	what, dist := look_forward()
+	switch what {
+	case "enemy":
+		shoot()
+		return
+	case "enemy_flag":
+		move_forward()
+		return
+	case "built_wall":
+		if dist <= 3 {
+			shoot() // break through
+			return
+		}
+	}
+	if scan[id] > 0 {
+		scan[id]--
+		turn_right()
+		return
+	}
+	if moves[id] >= 5 {
+		moves[id] = 0
+		scan[id] = 3
+		turn_right()
+		return
+	}
+	if dist > 1 && move_forward() {
+		moves[id]++
+		return
+	}
+	if randInt(2) == 0 {
+		turn_left()
+	} else {
+		turn_right()
+	}
+}

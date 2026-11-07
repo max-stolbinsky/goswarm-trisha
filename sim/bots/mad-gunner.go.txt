@@ -1,0 +1,15 @@
+// Explores randomly and shoots everything on sight.
+func loop() {
+	if randInt(5) == 0 {
+		shoot()
+		return
+	}
+	choice := randInt(6)
+	if choice < 3 {
+		move_forward()
+	} else if choice < 5 {
+		turn_right()
+	} else {
+		turn_left()
+	}
+}

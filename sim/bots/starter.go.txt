@@ -1,0 +1,328 @@
+// Starter robot: plays every mode. Read it, run it, then make it yours!
+//
+//   classic    - the flag is always near the middle: sweep that area
+//   deathmatch - warriors hold position and look around, shooting enemies
+//                that walk into sight; later they go hunting
+//   ctf        - the builder walls in our flag and makes warriors;
+//                warriors sweep the enemy's corner for their flag
+//
+// loop() runs once per unit every tick, and every call acts on the unit
+// that is running. Units share global variables, so each unit keeps its
+// own memory in a map keyed by my_id().
+
+const (
+	Up = iota
+	Right
+	Down
+	Left
+)
+
+// Unit is one unit's memory.
+type Unit struct {
+	tx, ty    int  // where it is heading
+	budget    int  // ticks left to get there before picking a new target
+	phase     int  // sweep progress: 0 start, 1 to a corner, 2 zigzag, 3 roam
+	moves     int  // moves since the last look-around
+	scan      int  // turns left in the current look-around
+	detour    int  // ticks left going around an obstacle
+	detourDir int  // the direction of that detour
+	dodge     bool // turned away from a bullet: step aside now
+	horiz     bool // the last move was horizontal (zigzags alternate)
+}
+
+var units = map[int]*Unit{}
+
+// tick counts game ticks. Units run in id order, so a new tick starts
+// whenever the ids start over.
+var tick, lastID int
+
+func loop() {
+	if my_id() <= lastID {
+		tick++
+	}
+	lastID = my_id()
+	u, ok := units[my_id()]
+	if !ok {
+		u = &Unit{}
+		units[my_id()] = u
+	}
+	what, dist := look_forward()
+
+	// A flag we want is straight ahead: drive at it. Touching it wins.
+	if what == "flag" || what == "enemy_flag" {
+		u.scan = 0
+		move_forward()
+		return
+	}
+	if my_kind() == "builder" {
+		builder(u, what, dist)
+		return
+	}
+	if what == "enemy" {
+		shoot()
+		return
+	}
+	// An enemy bullet in our line: turn now, step out of its way next tick.
+	if what == "bullet" {
+		u.dodge = true
+		turn_right()
+		return
+	}
+	if u.dodge {
+		u.dodge = false
+		move_forward()
+		return
+	}
+	// Finish a look-around: four right turns see every direction.
+	if u.scan > 0 {
+		u.scan--
+		turn_right()
+		return
+	}
+
+	g := get_grid_size()
+	switch game_mode() {
+	case "classic":
+		sweep(u, g/2-5, g/2-5, g/2+4, g/2+4)
+	case "ctf":
+		raid(u, what, dist)
+	default:
+		hunt(u)
+	}
+}
+
+// hunt holds position for a while, turning to look in every direction:
+// moving units are easy to hit from the side, so let the enemy come. Then
+// it roams the map, looking around every few moves.
+func hunt(u *Unit) {
+	if tick < 400 {
+		turn_right()
+		return
+	}
+	if u.budget <= 0 || near(u) {
+		g := get_grid_size()
+		u.target(2+randInt(g-4), 2+randInt(g-4))
+	}
+	if u.moves >= 5 {
+		u.moves = 0
+		u.scan = 3
+		turn_right()
+		return
+	}
+	step(u, false)
+}
+
+// raid sweeps the enemy's home corner for their flag, shooting through
+// walls built around it.
+func raid(u *Unit, what string, dist int) {
+	g := get_grid_size()
+	fx, _ := my_flag()
+	x, _ := get_pos()
+	home := g / 4
+	if home > 8 {
+		home = 8
+	}
+	lo, hi := g-2-home, g-3 // the enemy flag is somewhere in this corner
+	if fx >= g/2 {
+		lo, hi = 2, 1+home
+	}
+	// Walls ahead on the enemy side were built by them: break through.
+	if what == "built_wall" && dist <= 2 && (x-g/2)*(fx-g/2) < 0 {
+		shoot()
+		return
+	}
+	sweep(u, lo, lo, hi, hi)
+}
+
+// sweep searches the box (x0, y0)-(x1, y1): it heads for the nearest
+// corner, then zigzags to the opposite one. Every turn of the zigzag looks
+// along a new row or column, so the walk sees the whole box. After that it
+// roams the box and looks around at every stop.
+func sweep(u *Unit, x0, y0, x1, y1 int) {
+	x, y := get_pos()
+	switch u.phase {
+	case 0:
+		cx, cy := x0, y0
+		if abs(x-x1) < abs(x-x0) {
+			cx = x1
+		}
+		if abs(y-y1) < abs(y-y0) {
+			cy = y1
+		}
+		u.target(cx, cy)
+		u.phase = 1
+	case 1:
+		if near(u) || u.budget <= 0 {
+			u.target(x0+x1-u.tx, y0+y1-u.ty) // the opposite corner
+			u.phase = 2
+		}
+	case 2:
+		if near(u) || u.budget <= 0 {
+			u.phase = 3
+		}
+	default:
+		if near(u) || u.budget <= 0 {
+			u.target(x0+randInt(x1-x0+1), y0+randInt(y1-y0+1))
+			u.scan = 3
+			turn_right()
+			return
+		}
+	}
+	if u.phase != 2 && u.moves >= 8 {
+		u.moves = 0
+		u.scan = 3
+		turn_right()
+		return
+	}
+	step(u, u.phase == 2)
+}
+
+// Our walls go on the four cells around our flag.
+var walled [4]bool
+var wallTries [4]int
+
+func builder(u *Unit, what string, dist int) {
+	if busy() > 0 {
+		return // still building
+	}
+	if my_units() < 3 {
+		makeWarrior()
+		return
+	}
+	fx, fy := my_flag()
+	for side := Up; side <= Left; side++ {
+		if walled[side] {
+			continue
+		}
+		dx, dy := delta(side)
+		sx, sy := fx+2*dx, fy+2*dy // stand here, facing the flag
+		g := get_grid_size()
+		if sx < 0 || sy < 0 || sx >= g || sy >= g {
+			walled[side] = true
+			continue
+		}
+		x, y := get_pos()
+		if x != sx || y != sy {
+			if u.tx != sx || u.ty != sy {
+				u.target(sx, sy)
+			}
+			if u.budget <= 0 {
+				walled[side] = true // can't get there: skip this side
+			}
+			step(u, false)
+			return
+		}
+		face := (side + 2) % 4
+		if get_dir() != face {
+			turnTo(face)
+			return
+		}
+		if (what == "built_wall" && dist == 1) || build_wall() || wallTries[side] > 5 {
+			walled[side] = true
+		}
+		wallTries[side]++
+		return
+	}
+	if my_units() < 6 { // the builder plus up to 5 warriors
+		makeWarrior()
+		return
+	}
+	turn_right() // nothing to do: keep watch
+}
+
+func makeWarrior() {
+	if !build_warrior() {
+		turn_right() // the cell ahead isn't free: try another side
+	}
+}
+
+// target sets where the unit is heading, with a time limit to get there.
+func (u *Unit) target(x, y int) {
+	cx, cy := get_pos()
+	u.tx, u.ty = x, y
+	u.budget = 3*(abs(x-cx)+abs(y-cy)) + 20
+}
+
+func near(u *Unit) bool {
+	x, y := get_pos()
+	return abs(u.tx-x)+abs(u.ty-y) <= 1
+}
+
+// step moves one cell towards the target (or turns towards it). With
+// zigzag it alternates horizontal and vertical moves.
+func step(u *Unit, zigzag bool) {
+	u.budget--
+	x, y := get_pos()
+	dx, dy := u.tx-x, u.ty-y
+	want := u.detourDir
+	if u.detour > 0 {
+		u.detour--
+	} else {
+		horiz := abs(dx) >= abs(dy)
+		if zigzag && dx != 0 && dy != 0 {
+			horiz = !u.horiz
+		}
+		want = towards(dx, dy, horiz)
+	}
+	if get_dir() != want {
+		turnTo(want)
+		return
+	}
+	if move_forward() {
+		u.moves++
+		u.horiz = want == Left || want == Right
+		return
+	}
+	// Blocked (that used up this tick's action): go around along the other
+	// axis for a few moves, starting next tick.
+	horiz := want == Up || want == Down
+	u.detourDir = towards(dx, dy, horiz)
+	if u.detourDir == want || randInt(4) == 0 {
+		u.detourDir = (want + 1 + 2*randInt(2)) % 4 // left or right
+	}
+	u.detour = 2 + randInt(4)
+}
+
+// towards picks the direction along one axis (the other if that one is done).
+func towards(dx, dy int, horiz bool) int {
+	if horiz && dx != 0 || dy == 0 {
+		if dx > 0 {
+			return Right
+		}
+		if dx < 0 {
+			return Left
+		}
+		return get_dir()
+	}
+	if dy > 0 {
+		return Down
+	}
+	return Up
+}
+
+func turnTo(dir int) {
+	if (dir-get_dir()+4)%4 == 3 {
+		turn_left()
+	} else {
+		turn_right()
+	}
+}
+
+func delta(dir int) (int, int) {
+	switch dir {
+	case Up:
+		return 0, -1
+	case Right:
+		return 1, 0
+	case Down:
+		return 0, 1
+	}
+	return -1, 0
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}

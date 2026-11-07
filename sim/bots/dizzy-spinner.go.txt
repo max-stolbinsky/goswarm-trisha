@@ -1,0 +1,11 @@
+// Spins around a lot, occasionally moves forward.
+func loop() {
+	choice := randInt(10)
+	if choice < 3 {
+		move_forward()
+	} else if choice < 7 {
+		turn_right()
+	} else {
+		turn_left()
+	}
+}

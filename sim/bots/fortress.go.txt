@@ -1,0 +1,59 @@
+// A capture-the-flag bot: the builder makes two warriors, then walls itself
+// and its flag in, building in every direction it can; warriors hunt for the
+// enemy flag and shoot anything hostile.
+var turnsWithoutBuilding int
+
+func builder() {
+	if busy() > 0 {
+		return
+	}
+	if my_units() < 3 && build_warrior() {
+		return
+	}
+	if build_wall() {
+		turnsWithoutBuilding = 0
+		return
+	}
+	turnsWithoutBuilding++
+	if turnsWithoutBuilding > 4 {
+		// Boxed in or out of walls: step somewhere new.
+		turnsWithoutBuilding = 0
+		if move_forward() {
+			return
+		}
+	}
+	turn_right()
+}
+
+func warrior() {
+	what, dist := look_forward()
+	switch what {
+	case "enemy":
+		shoot()
+		return
+	case "enemy_flag":
+		move_forward()
+		return
+	case "built_wall":
+		if dist <= 2 {
+			shoot()
+			return
+		}
+	}
+	if dist > 1 && randInt(6) > 0 && move_forward() {
+		return
+	}
+	if randInt(2) == 0 {
+		turn_left()
+	} else {
+		turn_right()
+	}
+}
+
+func loop() {
+	if my_kind() == "builder" {
+		builder()
+	} else {
+		warrior()
+	}
+}

@@ -1,0 +1,10 @@
+// Goes straight and turns when blocked.
+func loop() {
+	if !move_forward() {
+		if randInt(2) == 0 {
+			turn_left()
+		} else {
+			turn_right()
+		}
+	}
+}

@@ -1,0 +1,11 @@
+// Moves randomly, sometimes finds the flag by luck.
+func loop() {
+	choice := randInt(4)
+	if choice == 0 {
+		move_forward()
+	} else if choice == 1 {
+		turn_left()
+	} else if choice == 2 {
+		turn_right()
+	}
+}
