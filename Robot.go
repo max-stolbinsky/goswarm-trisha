@@ -1,5 +1,6 @@
-// Trisha v2: lean CPU + Drone / Shield / Radar modules.
-// Long DM hold, uncleared-cell search for Classic/CTF.
+// Trisha v3: ladder-safe CPU. Modules used sparingly.
+// DM: hold-and-spin (Starter-style). CTF/Classic: cheap unseen search.
+// Hot path avoids maps, ray paints, and per-tick radar/drone work.
 
 const (
 	Up = iota
@@ -11,18 +12,17 @@ const (
 type Unit struct {
 	tx, ty, budget, phase int
 	moves, scan, dodge    int
-	visits                map[int]int
+	horiz                 bool
 }
 
 var units = map[int]*Unit{}
 var seen [40][40]bool
-var wallAt [40][40]bool
 var tick, lastID int
 var flagKnown bool
 var flagX, flagY int
-var enemyX, enemyY, enemyAge int
-var hasRadar, hasDrone, hasShield = -1, -1, -1 // -1 unk, 0 no, 1 yes
-var droneTick int                     // last tick we launched the drone
+var modsReady bool
+var hasRadar, hasDrone, hasShield bool
+var droneDone bool // one drone launch attempt this ready-window
 var dx = [4]int{0, 1, 0, -1}
 var dy = [4]int{-1, 0, 1, 0}
 
@@ -35,40 +35,24 @@ func abs(v int) int {
 	return v
 }
 
-func key(x, y int) int { return x*1000 + y }
-
 func me() *Unit {
 	id := my_id()
 	u, ok := units[id]
 	if !ok {
-		u = &Unit{visits: map[int]int{}}
+		u = &Unit{}
 		units[id] = u
 	}
 	return u
 }
 
-func ensureMods() {
-	if hasRadar < 0 {
-		if has_module("radar") {
-			hasRadar = 1
-		} else {
-			hasRadar = 0
-		}
+func initMods() {
+	if modsReady {
+		return
 	}
-	if hasDrone < 0 {
-		if has_module("drone") {
-			hasDrone = 1
-		} else {
-			hasDrone = 0
-		}
-	}
-	if hasShield < 0 {
-		if has_module("shield") {
-			hasShield = 1
-		} else {
-			hasShield = 0
-		}
-	}
+	hasRadar = has_module("radar")
+	hasDrone = has_module("drone")
+	hasShield = has_module("shield")
+	modsReady = true
 }
 
 func turnTo(dir int) {
@@ -79,97 +63,40 @@ func turnTo(dir int) {
 	}
 }
 
-func markSeen(x, y int) {
-	if x >= 0 && y >= 0 && x < 40 && y < 40 {
-		seen[y][x] = true
-	}
-}
-
-func markWall(x, y int) {
-	if x >= 0 && y >= 0 && x < 40 && y < 40 {
-		wallAt[y][x] = true
-		seen[y][x] = true
-	}
-}
-
-func isWallXY(x, y int) bool {
-	if x < 0 || y < 0 || x >= 40 || y >= 40 {
-		return true
-	}
-	return wallAt[y][x]
-}
-
-func observeDir(what string, dist, dir int) {
+func noteHit(what string, dist int) {
 	if dist < 1 {
 		return
 	}
-	x, y := get_pos()
-	// Full ray only in Classic/CTF search; DM just needs the hit cell.
-	if game_mode() != "deathmatch" {
-		lim := dist
-		if lim > 10 {
-			lim = 10
-		}
-		for i := 1; i < lim; i++ {
-			markSeen(x+dx[dir]*i, y+dy[dir]*i)
-		}
-	}
-	ex, ey := x+dx[dir]*dist, y+dy[dir]*dist
-	if what == "wall" || what == "my_flag" {
-		markWall(ex, ey)
-		return
-	}
-	markSeen(ex, ey)
 	if what == "flag" || what == "enemy_flag" {
+		x, y := get_pos()
+		d := get_dir()
 		flagKnown = true
-		flagX, flagY = ex, ey
-	}
-	if what == "enemy" {
-		enemyX, enemyY, enemyAge = ex, ey, tick
+		flagX, flagY = x+dx[d]*dist, y+dy[d]*dist
 	}
 }
 
-func observe(what string, dist int) {
-	markSeen(get_pos())
+func markHere() {
 	x, y := get_pos()
-	_ = x
-	_ = y
-	observeDir(what, dist, get_dir())
+	if x >= 0 && y >= 0 && x < 40 && y < 40 {
+		seen[y][x] = true
+	}
 }
 
-func ingestCell(label string, cx, cy int) {
-	if cx < 0 || cy < 0 || cx >= 40 || cy >= 40 {
+func markCell(x, y int) {
+	if x >= 0 && y >= 0 && x < 40 && y < 40 {
+		seen[y][x] = true
+	}
+}
+
+// Drone: only until flag found; scan 9×9 only for flag/enemy labels (no full paint).
+func maybeDrone() {
+	if !hasDrone || flagKnown || drone_ready() != 0 {
 		return
 	}
-	switch label {
-	case "wall", "my_flag":
-		markWall(cx, cy)
-	case "empty", "ally", "enemy", "flag", "enemy_flag", "built_wall", "construction", "bullet":
-		markSeen(cx, cy)
-		if label == "flag" || label == "enemy_flag" {
-			flagKnown = true
-			flagX, flagY = cx, cy
-		}
-		if label == "enemy" {
-			enemyX, enemyY, enemyAge = cx, cy, tick
-		}
-	default:
-		if label != "" {
-			markSeen(cx, cy)
-		}
+	if droneDone {
+		return
 	}
-}
-
-// tryDrone scouts the flag zone (CTF/classic) or enemy half (DM). Shared CD.
-func tryDrone() bool {
-	ensureMods()
-	if hasDrone != 1 || drone_ready() != 0 {
-		return false
-	}
-	// One launch per ready window (first unit that reaches here).
-	if tick == droneTick {
-		return false
-	}
+	droneDone = true
 	g := get_grid_size()
 	cx, cy := g/2, g/2
 	if game_mode() == "ctf" {
@@ -183,50 +110,34 @@ func tryDrone() bool {
 			lo, hi = 2, 1+home
 		}
 		cx, cy = (lo+hi)/2, (lo+hi)/2
-		if flagKnown {
-			cx, cy = flagX, flagY
-		}
-	} else if game_mode() == "deathmatch" {
-		x, y := get_pos()
-		cx, cy = g-1-x, g-1-y
-		if enemyAge > 0 && tick-enemyAge < 200 {
-			cx, cy = enemyX, enemyY
-		}
-	} else if flagKnown {
-		cx, cy = flagX, flagY
 	}
 	cells, ok := drone(cx, cy)
 	if !ok {
-		return false
+		return
 	}
-	droneTick = tick
-	// cells[r][c] covers (cx-4+c, cy-4+r); center is [4][4].
-	for r := 0; r < 9; r++ {
-		if r >= len(cells) {
-			break
-		}
+	for r := 0; r < len(cells) && r < 9; r++ {
 		row := cells[r]
-		for c := 0; c < 9; c++ {
-			if c >= len(row) {
-				break
+		for c := 0; c < len(row) && c < 9; c++ {
+			lab := row[c]
+			if lab == "flag" || lab == "enemy_flag" {
+				flagKnown = true
+				flagX, flagY = cx-4+c, cy-4+r
+				return
 			}
-			ingestCell(row[c], cx-4+c, cy-4+r)
 		}
 	}
-	return true
 }
 
-// radarReact: side looks. Turn toward enemy/flag/bullet — costs the action.
-func radarReact(u *Unit) bool {
-	ensureMods()
-	if hasRadar != 1 {
+// Radar at most once per tick for the whole squad (unit id == tick%8 style).
+func radarSnap(u *Unit) bool {
+	if !hasRadar {
 		return false
 	}
-	wl, dl := look_left()
-	observeDir(wl, dl, (get_dir()+3)%4)
-	wr, dr := look_right()
-	observeDir(wr, dr, (get_dir()+1)%4)
-
+	if my_id()%5 != tick%5 {
+		return false
+	}
+	wl, _ := look_left()
+	wr, _ := look_right()
 	if my_kind() != "builder" {
 		if wl == "enemy" {
 			turn_left()
@@ -245,20 +156,12 @@ func radarReact(u *Unit) bool {
 		turn_right()
 		return true
 	}
-	// Side bullet: step out if we still have a shield, else turn away.
-	if wl == "bullet" && dl <= 4 {
-		if hasShield == 1 && shielded() {
-			return false
+	if (wl == "bullet" || wr == "bullet") && !(hasShield && shielded()) {
+		if wl == "bullet" {
+			turn_right()
+		} else {
+			turn_left()
 		}
-		turn_right()
-		u.dodge = 1
-		return true
-	}
-	if wr == "bullet" && dr <= 4 {
-		if hasShield == 1 && shielded() {
-			return false
-		}
-		turn_left()
 		u.dodge = 1
 		return true
 	}
@@ -266,62 +169,63 @@ func radarReact(u *Unit) bool {
 }
 
 func target(u *Unit, x, y int) {
+	cx, cy := get_pos()
 	u.tx, u.ty = x, y
-	u.budget = 120
-	u.visits = map[int]int{}
+	u.budget = 3*(abs(x-cx)+abs(y-cy)) + 20
 }
 
 func near(u *Unit) bool {
 	x, y := get_pos()
-	return abs(u.tx-x) + abs(u.ty-y) <= 1
+	return abs(u.tx-x)+abs(u.ty-y) <= 1
 }
 
-func navigate(u *Unit) {
-	x, y := get_pos()
-	g := get_grid_size()
-	dir := get_dir()
-	best, want := 1000000, dir
-	for i := 0; i < 4; i++ {
-		d := (dir + i) % 4
-		nx, ny := x+dx[d], y+dy[d]
-		if nx < 0 || ny < 0 || nx >= g || ny >= g || isWallXY(nx, ny) {
-			continue
+func toward(ddx, ddy int, horiz bool) int {
+	if (horiz && ddx != 0) || ddy == 0 {
+		if ddx > 0 {
+			return Right
 		}
-		score := 4*(abs(nx-u.tx)+abs(ny-u.ty)) + u.visits[key(nx, ny)]*9
-		turn := (d - dir + 4) % 4
-		if turn == 3 {
-			turn = 1
+		if ddx < 0 {
+			return Left
 		}
-		score += turn
-		if score < best {
-			best = score
-			want = d
-		}
+		return get_dir()
 	}
+	if ddy > 0 {
+		return Down
+	}
+	return Up
+}
+
+// Starter-like step: no visit maps, one look when facing target.
+func step(u *Unit, zigzag bool) {
+	u.budget--
+	x, y := get_pos()
+	ddx, ddy := u.tx-x, u.ty-y
+	horiz := abs(ddx) >= abs(ddy)
+	if zigzag && ddx != 0 && ddy != 0 {
+		horiz = !u.horiz
+	}
+	want := toward(ddx, ddy, horiz)
 	if get_dir() != want {
 		turnTo(want)
 		return
 	}
 	what, dist := look_forward()
-	observe(what, dist)
-	if dist == 1 && what == "built_wall" && my_kind() != "builder" {
+	noteHit(what, dist)
+	if what == "enemy" && my_kind() != "builder" {
 		shoot()
 		return
 	}
-	if dist == 1 && (what == "ally" || what == "construction" || what == "bullet") {
-		u.visits[key(x, y)]++
-		turn_right()
+	if what == "built_wall" && dist == 1 && my_kind() != "builder" {
+		shoot()
 		return
 	}
 	if move_forward() {
 		u.moves++
-		nx, ny := get_pos()
-		u.visits[key(nx, ny)]++
-		markSeen(nx, ny)
-	} else {
-		u.visits[key(x, y)]++
+		u.horiz = want == Left || want == Right
+		markHere()
+		return
 	}
-	u.budget--
+	u.horiz = !u.horiz
 }
 
 func pickUnseen(u *Unit, lo, hi int) {
@@ -329,16 +233,10 @@ func pickUnseen(u *Unit, lo, hi int) {
 	best, bx, by := 1000000, lo, lo
 	for a := lo; a <= hi; a++ {
 		for b := lo; b <= hi; b++ {
-			if a < 0 || b < 0 || a >= 40 || b >= 40 {
-				continue
-			}
-			if seen[b][a] || wallAt[b][a] {
+			if a < 0 || b < 0 || a >= 40 || b >= 40 || seen[b][a] {
 				continue
 			}
 			score := abs(x-a) + abs(y-b)
-			if game_mode() == "ctf" {
-				score += ((a + b + my_id()) % 3) * 2
-			}
 			if score < best {
 				best = score
 				bx, by = a, b
@@ -363,7 +261,7 @@ func search(u *Unit) {
 		if u.tx != flagX || u.ty != flagY {
 			target(u, flagX, flagY)
 		}
-		navigate(u)
+		step(u, false)
 		return
 	}
 	lo, hi := g/2-5, g/2+4
@@ -384,20 +282,16 @@ func search(u *Unit) {
 			lo, hi = 2, 1+home
 		}
 	}
-	needNew := u.budget <= 0 || (x == u.tx && y == u.ty)
-	if !needNew && u.tx >= 0 && u.ty >= 0 && u.tx < 40 && u.ty < 40 && seen[u.ty][u.tx] {
-		needNew = true
-	}
-	if needNew {
+	if u.budget <= 0 || (x == u.tx && y == u.ty) {
 		pickUnseen(u, lo, hi)
 	}
-	if u.moves >= 6 && (game_mode() != "classic" || (x >= lo && x <= hi && y >= lo && y <= hi)) {
+	if u.moves >= 8 {
 		u.moves = 0
 		u.scan = 3
 		turn_right()
 		return
 	}
-	navigate(u)
+	step(u, u.phase == 2)
 }
 
 func hunt(u *Unit) {
@@ -405,14 +299,9 @@ func hunt(u *Unit) {
 		turn_right()
 		return
 	}
-	if enemyAge > 0 && tick-enemyAge < 80 {
-		target(u, enemyX, enemyY)
-		navigate(u)
-		return
-	}
 	x, y := get_pos()
 	g := get_grid_size()
-	if u.budget <= 0 || (x == u.tx && y == u.ty) {
+	if u.budget <= 0 || near(u) {
 		if u.phase == 0 {
 			target(u, g-1-x, g-1-y)
 			u.phase = 1
@@ -420,19 +309,16 @@ func hunt(u *Unit) {
 			target(u, 2+randInt(g-4), 2+randInt(g-4))
 		}
 	}
-	if u.moves >= 4 {
+	if u.moves >= 5 {
 		u.moves = 0
 		u.scan = 3
 		turn_right()
 		return
 	}
-	navigate(u)
+	step(u, false)
 }
 
-func builder(u *Unit, what string, dist int) {
-	_ = u
-	_ = what
-	_ = dist
+func builder() {
 	if busy() > 0 {
 		return
 	}
@@ -449,18 +335,19 @@ func loop() {
 	id := my_id()
 	if id <= lastID {
 		tick++
+		droneDone = false // new tick: allow one drone try again if ready
 	}
 	lastID = id
+	initMods()
 	u := me()
-	ensureMods()
-	markSeen(get_pos())
 
 	what, dist := look_forward()
-	observe(what, dist)
+	noteHit(what, dist)
 
-	// Drone once per cooldown; skip during early DM hold (spinning is enough).
-	if !(game_mode() == "deathmatch" && tick < dmHoldTicks) {
-		tryDrone()
+	mode := game_mode()
+	// Drone only in CTF/classic while flag unknown — never during DM hold.
+	if mode != "deathmatch" && !flagKnown {
+		maybeDrone()
 	}
 
 	if busy() > 0 {
@@ -468,32 +355,7 @@ func loop() {
 	}
 	if u.dodge > 0 {
 		u.dodge = 0
-		if dist > 1 || what == "flag" || what == "enemy_flag" {
-			move_forward()
-		} else {
-			turn_right()
-		}
-		return
-	}
-	// Front bullet: dodge unless shield still up and the shot is far.
-	if what == "bullet" && dist <= 8 {
-		canTank := hasShield == 1 && shielded() && dist > 2
-		if !canTank {
-			x, y := get_pos()
-			d := (get_dir() + 1) % 4
-			g := get_grid_size()
-			nx, ny := x+dx[d], y+dy[d]
-			if nx < 0 || ny < 0 || nx >= g || ny >= g || isWallXY(nx, ny) {
-				turn_left()
-			} else {
-				turn_right()
-			}
-			u.dodge = 1
-			return
-		}
-	}
-	if what == "enemy" && my_kind() != "builder" {
-		shoot()
+		move_forward()
 		return
 	}
 	if what == "flag" || what == "enemy_flag" {
@@ -501,11 +363,31 @@ func loop() {
 		move_forward()
 		return
 	}
-	if radarReact(u) {
+	if what == "enemy" && my_kind() != "builder" {
+		shoot()
 		return
 	}
+	if what == "bullet" && dist <= 6 {
+		if !(hasShield && shielded() && dist > 2) {
+			turn_right()
+			u.dodge = 1
+			return
+		}
+	}
+
+	// Cheap DM hold: no radar, no maps — just spin and shoot (above).
+	if mode == "deathmatch" && tick < dmHoldTicks {
+		turn_right()
+		return
+	}
+
+	// Radar only after hold / in CTF-classic, and only 1 unit per tick.
+	if radarSnap(u) {
+		return
+	}
+
 	if my_kind() == "builder" {
-		builder(u, what, dist)
+		builder()
 		return
 	}
 	if u.scan > 0 {
@@ -513,9 +395,16 @@ func loop() {
 		turn_right()
 		return
 	}
-	if game_mode() == "deathmatch" {
+	if mode == "deathmatch" {
 		hunt(u)
 		return
+	}
+	// Mark stood cell cheaply for search coverage.
+	markHere()
+	if dist >= 1 {
+		x, y := get_pos()
+		d := get_dir()
+		markCell(x+dx[d]*dist, y+dy[d]*dist)
 	}
 	search(u)
 }
