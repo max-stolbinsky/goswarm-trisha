@@ -1,6 +1,6 @@
 // Trisha v3: ladder-safe CPU. Modules used sparingly.
-// DM: hold-and-spin (Starter-style). CTF/Classic: cheap unseen search.
-// Hot path avoids maps, ray paints, and per-tick radar/drone work.
+// DM: hold facing the enemy half; break hold on contact; then hunt.
+// CTF/Classic: cheap unseen search + capped drone.
 
 const (
 	Up = iota
@@ -21,6 +21,8 @@ var seen [40][40]bool
 var tick, lastID int
 var flagKnown bool
 var flagX, flagY int
+var enemyX, enemyY, enemyAge int
+var alarm bool // DM: contact seen — leave the corner
 var modsReady bool
 var hasRadar, hasDrone, hasShield bool
 var droneDone bool // one drone launch attempt this ready-window
@@ -29,8 +31,8 @@ var dx = [4]int{0, 1, 0, -1}
 var dy = [4]int{-1, 0, 1, 0}
 
 const (
-	dmHoldTicks  = 1400
-	droneShotMax = 4 // cover the flag box, then rely on foot search
+	dmHoldTicks  = 900 // long enough vs rushers; alarm cuts it short
+	droneShotMax = 4   // cover the flag box, then rely on foot search
 )
 
 func abs(v int) int {
@@ -72,11 +74,19 @@ func noteHit(what string, dist int) {
 	if dist < 1 {
 		return
 	}
+	x, y := get_pos()
+	d := get_dir()
+	ex, ey := x+dx[d]*dist, y+dy[d]*dist
 	if what == "flag" || what == "enemy_flag" {
-		x, y := get_pos()
-		d := get_dir()
 		flagKnown = true
-		flagX, flagY = x+dx[d]*dist, y+dy[d]*dist
+		flagX, flagY = ex, ey
+	}
+	if what == "enemy" {
+		enemyX, enemyY, enemyAge = ex, ey, tick
+		alarm = true
+	}
+	if what == "bullet" {
+		alarm = true
 	}
 }
 
@@ -174,7 +184,7 @@ func maybeDrone() {
 	}
 }
 
-// Radar at most once per tick for the whole squad (unit id == tick%8 style).
+// Radar at most once per tick for the whole squad.
 func radarSnap(u *Unit) bool {
 	if !hasRadar {
 		return false
@@ -182,8 +192,14 @@ func radarSnap(u *Unit) bool {
 	if my_id()%5 != tick%5 {
 		return false
 	}
-	wl, _ := look_left()
-	wr, _ := look_right()
+	wl, dl := look_left()
+	wr, dr := look_right()
+	if wl == "enemy" || wl == "bullet" || wl == "flag" || wl == "enemy_flag" {
+		noteSide(wl, dl, true)
+	}
+	if wr == "enemy" || wr == "bullet" || wr == "flag" || wr == "enemy_flag" {
+		noteSide(wr, dr, false)
+	}
 	if my_kind() != "builder" {
 		if wl == "enemy" {
 			turn_left()
@@ -212,6 +228,71 @@ func radarSnap(u *Unit) bool {
 		return true
 	}
 	return false
+}
+
+func noteSide(what string, dist int, left bool) {
+	if dist < 1 {
+		return
+	}
+	x, y := get_pos()
+	d := get_dir()
+	if left {
+		d = (d + 3) % 4
+	} else {
+		d = (d + 1) % 4
+	}
+	ex, ey := x+dx[d]*dist, y+dy[d]*dist
+	if what == "enemy" || what == "bullet" {
+		enemyX, enemyY, enemyAge = ex, ey, tick
+		alarm = true
+	}
+	if what == "flag" || what == "enemy_flag" {
+		flagKnown = true
+		flagX, flagY = ex, ey
+	}
+}
+
+// Preferred facing during DM hold: toward the mirrored enemy half.
+func holdDir() int {
+	x, y := get_pos()
+	g := get_grid_size()
+	// Bias by unit id so the squad does not share one blind cone.
+	id := my_id()
+	if id%2 == 0 {
+		if x < g/2 {
+			return Right
+		}
+		return Left
+	}
+	if y < g/2 {
+		return Down
+	}
+	return Up
+}
+
+// Dodge toward the map interior, not into the map edge.
+func dodgeAway() {
+	x, y := get_pos()
+	g := get_grid_size()
+	d := get_dir()
+	// Prefer a side step toward center.
+	right := (d + 1) % 4
+	left := (d + 3) % 4
+	rx, ry := x+dx[right], y+dy[right]
+	lx, ly := x+dx[left], y+dy[left]
+	scoreR := abs(rx-g/2) + abs(ry-g/2)
+	scoreL := abs(lx-g/2) + abs(ly-g/2)
+	if rx < 0 || ry < 0 || rx >= g || ry >= g {
+		scoreR = 1000
+	}
+	if lx < 0 || ly < 0 || lx >= g || ly >= g {
+		scoreL = 1000
+	}
+	if scoreL < scoreR {
+		turn_left()
+	} else {
+		turn_right()
+	}
 }
 
 func target(u *Unit, x, y int) {
@@ -365,13 +446,40 @@ func search(u *Unit) {
 	step(u, u.phase == 2)
 }
 
-func hunt(u *Unit) {
-	if tick < dmHoldTicks {
+func holding() bool {
+	return !alarm && tick < dmHoldTicks
+}
+
+func dmHold(u *Unit) {
+	// Rare glance left/right via radar (one unit/tick) already ran in loop.
+	// Mostly face the enemy half; every ~7 ticks peek with a turn.
+	if tick%7 == my_id()%7 {
 		turn_right()
+		return
+	}
+	want := holdDir()
+	if get_dir() != want {
+		turnTo(want)
+		return
+	}
+	// Already facing out: idle this tick (look already done). Saves CPU.
+}
+
+func hunt(u *Unit) {
+	if holding() {
+		dmHold(u)
 		return
 	}
 	x, y := get_pos()
 	g := get_grid_size()
+	// Chase last known contact first.
+	if enemyAge > 0 && tick-enemyAge < 120 {
+		if u.tx != enemyX || u.ty != enemyY || u.budget <= 0 {
+			target(u, enemyX, enemyY)
+		}
+		step(u, false)
+		return
+	}
 	if u.budget <= 0 || near(u) {
 		if u.phase == 0 {
 			target(u, g-1-x, g-1-y)
@@ -439,20 +547,20 @@ func loop() {
 		return
 	}
 	if what == "bullet" && dist <= 6 {
+		// Under fire: leave DM hold even if we tank with the shield.
+		alarm = true
 		if !(hasShield && shielded() && dist > 2) {
-			turn_right()
+			dodgeAway()
 			u.dodge = 1
 			return
 		}
 	}
-
-	// Cheap DM hold: no radar, no maps — just spin and shoot (above).
-	if mode == "deathmatch" && tick < dmHoldTicks {
-		turn_right()
-		return
+	// Shield just broken → treat as contact.
+	if hasShield && !shielded() {
+		alarm = true
 	}
 
-	// Radar only after hold / in CTF-classic, and only 1 unit per tick.
+	// Radar in all modes (incl. DM hold), one unit per tick.
 	if radarSnap(u) {
 		return
 	}
