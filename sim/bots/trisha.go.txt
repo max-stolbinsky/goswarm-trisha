@@ -34,6 +34,7 @@ var walled [4]bool // CTF: four sides around our flag
 var wallTries [4]int
 var warriorRank = map[int]int{} // birth order among warriors
 var nextWarriorRank int
+var laneRow, laneCol int = -1, -1 // CTF: rows/cols seen full of bullets
 var dx = [4]int{0, 1, 0, -1}
 var dy = [4]int{-1, 0, 1, 0}
 
@@ -457,6 +458,106 @@ func campBeacon() (int, int) {
 	fx, fy := my_flag()
 	g := get_grid_size()
 	return clamp(g-1-fx, lo, hi), clamp(g-1-fy, lo, hi)
+}
+
+// A bullet stream marks its row or column. Defender fills the enemy-flag cross this way.
+func noteBulletLane(what string, dist int) {
+	if what != "bullet" || dist < 2 || dist > 16 {
+		return
+	}
+	x, y := get_pos()
+	d := get_dir()
+	if d == Left || d == Right {
+		laneRow = y
+	} else {
+		laneCol = x
+	}
+}
+
+func enemyFlagCross() (ex, ey int, ok bool) {
+	if !flagKnown {
+		return 0, 0, false
+	}
+	hx, hy := my_flag()
+	if flagX == hx && flagY == hy {
+		return 0, 0, false
+	}
+	return flagX, flagY, true
+}
+
+// Step off a known fire lane. Returns true if this tick was spent sidestepping.
+func sidestepLane(u *Unit) bool {
+	x, y := get_pos()
+	g := get_grid_size()
+	ex, ey, known := enemyFlagCross()
+	hotRow := laneRow == y || (known && y == ey && abs(x-ex) > 3)
+	hotCol := laneCol == x || (known && x == ex && abs(y-ey) > 3)
+	if !hotRow && !hotCol {
+		return false
+	}
+	side := 2
+	if my_id()%2 == 0 {
+		side = -2
+	}
+	tx, ty := x, y
+	if hotRow {
+		ty = y + side
+	}
+	if hotCol {
+		tx = x + side
+	}
+	targetAt(u, clamp(tx, 1, g-2), clamp(ty, 1, g-2))
+	step(u, false)
+	return true
+}
+
+// CTF raid: reach the enemy camp on a diagonal, never ride a bullet row/col.
+func ctfRaid(u *Unit, what string, dist int) {
+	noteBulletLane(what, dist)
+	if what == "bullet" && dist <= 10 {
+		x, y := get_pos()
+		g := get_grid_size()
+		d := get_dir()
+		side := 2
+		if my_id()%2 == 0 {
+			side = -2
+		}
+		tx, ty := x, y
+		if d == Left || d == Right {
+			ty = y + side
+		} else {
+			tx = x + side
+		}
+		targetAt(u, clamp(tx, 1, g-2), clamp(ty, 1, g-2))
+		step(u, false)
+		return
+	}
+	if sidestepLane(u) {
+		return
+	}
+	if ex, ey, ok := enemyFlagCross(); ok {
+		x, y := get_pos()
+		if abs(x-ex)+abs(y-ey) > 3 {
+			ox, oy := 2, 2
+			if my_id()%2 == 0 {
+				ox = -2
+			}
+			g := get_grid_size()
+			ax, ay := clamp(ex+ox, 1, g-2), clamp(ey+oy, 1, g-2)
+			if ay == laneRow {
+				ay = clamp(ay+2, 1, g-2)
+			}
+			if ax == laneCol {
+				ax = clamp(ax+2, 1, g-2)
+			}
+			if u.tx != ax || u.ty != ay || u.budget <= 0 {
+				targetAt(u, ax, ay)
+			}
+			step(u, false)
+			return
+		}
+	}
+	search(u)
 }
 
 func search(u *Unit) {
@@ -1002,7 +1103,7 @@ func ctfLoop(u *Unit, what string, dist int) {
 		return
 	}
 	markSight(dist)
-	search(u)
+	ctfRaid(u, what, dist)
 }
 
 func loop() {
@@ -1035,7 +1136,7 @@ func loop() {
 		shoot()
 		return
 	}
-	if what == "bullet" && dist <= 6 {
+	if what == "bullet" && dist <= 6 && !(game_mode() == "ctf" && my_kind() == "warrior") {
 		alarm = true
 		if !(hasShield && shielded() && dist > 2) {
 			dodgeAway()

@@ -1,0 +1,114 @@
+// Sits two warriors on the flag row and column and shoots every tick.
+// Everyone else walks toward the mirrored enemy flag.
+
+const (
+	Up = iota
+	Right
+	Down
+	Left
+)
+
+var dx = [4]int{0, 1, 0, -1}
+var dy = [4]int{-1, 0, 1, 0}
+var turret = map[int]bool{}
+var nextTurret int
+
+func loop() {
+	what, dist := look_forward()
+	if what == "enemy_flag" || what == "flag" {
+		move_forward()
+		return
+	}
+	if my_kind() == "builder" {
+		if busy() > 0 {
+			return
+		}
+		if my_units() < 4 {
+			if !build_warrior() {
+				turn_right()
+			}
+			return
+		}
+		turn_right()
+		return
+	}
+	id := my_id()
+	if _, ok := turret[id]; !ok && nextTurret < 2 {
+		turret[id] = true
+		nextTurret++
+	}
+	if turret[id] {
+		fx, fy := my_flag()
+		x, y := get_pos()
+		// First turret holds the flag column, second the flag row, both shooting outward.
+		var face int
+		if nextTurret == 1 || id%2 == 0 {
+			if y <= fy {
+				face = Down
+			} else {
+				face = Up
+			}
+			if x != fx {
+				// not yet on the column: step toward it, don't shoot sideways forever
+			}
+		} else {
+			if x <= fx {
+				face = Right
+			} else {
+				face = Left
+			}
+		}
+		if get_dir() != face {
+			if (face-get_dir()+4)%4 == 3 {
+				turn_left()
+			} else {
+				turn_right()
+			}
+			return
+		}
+		if what == "enemy" || what == "built_wall" {
+			shoot()
+			return
+		}
+		shoot()
+		return
+	}
+	if what == "enemy" || (what == "built_wall" && dist <= 2) {
+		shoot()
+		return
+	}
+	g := get_grid_size()
+	fx, fy := my_flag()
+	tx, ty := g-1-fx, g-1-fy
+	x, y := get_pos()
+	var want int
+	if abs(tx-x) >= abs(ty-y) && tx != x {
+		if tx > x {
+			want = Right
+		} else {
+			want = Left
+		}
+	} else if ty > y {
+		want = Down
+	} else {
+		want = Up
+	}
+	if get_dir() != want {
+		if (want-get_dir()+4)%4 == 3 {
+			turn_left()
+		} else {
+			turn_right()
+		}
+		return
+	}
+	if !move_forward() {
+		turn_right()
+	}
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
