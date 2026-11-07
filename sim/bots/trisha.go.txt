@@ -38,7 +38,7 @@ var dx = [4]int{0, 1, 0, -1}
 var dy = [4]int{-1, 0, 1, 0}
 
 const (
-	dmHoldTicks  = 900 // long enough vs rushers; alarm cuts it short
+	dmHoldTicks  = 280 // Starter leaves at 400; 900 was camping to death (sweep pick)
 	droneShotMax = 4   // cover the flag box, then rely on foot search
 	ctfGuards    = 1    // one approach guard (sweep: best overall with rear walls)
 	ctfRearWalls = true // seal rear sides after army is full
@@ -185,11 +185,13 @@ func maybeDrone() {
 }
 
 // Radar at most once per tick for the whole squad.
+// DM endgame (≤2 units): every warrior peeks — missing the last enemy loses the match.
 func radarSnap(u *Unit) bool {
 	if !hasRadar {
 		return false
 	}
-	if my_id()%5 != tick%5 {
+	endgame := game_mode() == "deathmatch" && my_units() <= 2
+	if !endgame && my_id()%5 != tick%5 {
 		return false
 	}
 	wl, dl := look_left()
@@ -512,13 +514,17 @@ func search(u *Unit) {
 }
 
 func holding() bool {
-	return !alarm && tick < dmHoldTicks
+	if alarm {
+		return false
+	}
+	// Stagger breakout so the pack does not leave as one blob.
+	leave := dmHoldTicks + (my_id()%5)*25
+	return tick < leave
 }
 
 func dmHold(u *Unit) {
-	// Rare glance left/right via radar (one unit/tick) already ran in loop.
-	// Mostly face the enemy half; every ~7 ticks peek with a turn.
-	if tick%7 == my_id()%7 {
+	// Peek often: long idle cones miss Starter's approach until point-blank.
+	if tick%4 == my_id()%4 {
 		turn_right()
 		return
 	}
@@ -527,7 +533,6 @@ func dmHold(u *Unit) {
 		turnTo(want)
 		return
 	}
-	// Already facing out: idle this tick (look already done). Saves CPU.
 }
 
 // Per-unit offset on a 2D grid so hunters fan out.
@@ -612,6 +617,86 @@ func hunt(u *Unit) {
 		u.scan = 3
 		turn_right()
 		return
+	}
+	step(u, false)
+}
+
+// DM 1v1 / 2v1: align onto the enemy's row or column, then close. No roam-spin.
+func duel(u *Unit) {
+	u.scan = 0
+	x, y := get_pos()
+	g := get_grid_size()
+	if enemyAge <= 0 {
+		if u.budget <= 0 || near(u) {
+			targetAt(u, inland(g/2+randInt(5)-2), inland(g/2+randInt(5)-2))
+		}
+		step(u, false)
+		return
+	}
+	ex, ey := enemyX, enemyY
+	age := tick - enemyAge
+	lane := my_id() % 2
+
+	// Already on a firing line: face the last-known cell (shoot happens in loop).
+	if x == ex || y == ey {
+		want := get_dir()
+		if y == ey {
+			if ex > x {
+				want = Right
+			} else if ex < x {
+				want = Left
+			}
+		} else {
+			if ey > y {
+				want = Down
+			} else if ey < y {
+				want = Up
+			}
+		}
+		if get_dir() != want {
+			turnTo(want)
+			return
+		}
+		// Close in; with a shield we can contest the lane, without — still advance
+		// but step() will dodge bullets via the shared loop.
+		if x != ex || y != ey {
+			tx, ty := clamp(ex, 1, g-2), clamp(ey, 1, g-2)
+			if u.tx != tx || u.ty != ty || u.budget <= 0 {
+				targetAt(u, tx, ty)
+			}
+			step(u, false)
+		}
+		return
+	}
+
+	// Not aligned: 2v1 pincer (one locks X, one locks Y); 1v1 picks nearer axis.
+	var tx, ty int
+	two := my_units() >= 2
+	if two && lane == 0 || !two && abs(x-ex) <= abs(y-ey) {
+		if x != ex {
+			tx, ty = ex, y
+		} else {
+			tx, ty = ex, ey
+		}
+	} else {
+		if y != ey {
+			tx, ty = x, ey
+		} else {
+			tx, ty = ex, ey
+		}
+	}
+	// Stale contact: expand a ring around last-known instead of map-wide roam.
+	if age > 60 {
+		ring := 2 + ((age-60)/8)%7
+		if lane == 0 {
+			tx, ty = ex+ring, ey
+		} else {
+			tx, ty = ex, ey+ring
+		}
+	}
+	tx, ty = clamp(tx, 1, g-2), clamp(ty, 1, g-2)
+	if u.tx != tx || u.ty != ty || u.budget <= 0 {
+		targetAt(u, tx, ty)
 	}
 	step(u, false)
 }
@@ -839,12 +924,21 @@ func classicLoop(u *Unit, what string, dist int) {
 }
 
 // Deathmatch: hold the spawn facing out, then hunt as a pack.
+// Late game (≤2 units): switch to duel — align and finish, don't roam-scan.
 func dmLoop(u *Unit, what string, dist int) {
 	if hasShield && !shielded() {
 		alarm = true
 	}
 	if my_kind() == "builder" {
 		dmBuilder()
+		return
+	}
+	if my_units() <= 2 {
+		u.scan = 0
+		if radarSnap(u) {
+			return
+		}
+		duel(u)
 		return
 	}
 	if radarSnap(u) || finishScan(u) {
