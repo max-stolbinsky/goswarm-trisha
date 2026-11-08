@@ -27,7 +27,7 @@ var flagX, flagY int
 var enemyX, enemyY, enemyAge int
 var alarm bool // DM: contact seen — leave the corner
 var modsReady bool
-var hasRadar, hasDrone, hasShield bool
+var hasRadar, hasDrone, hasShield, hasBoost bool
 var droneDone bool // one drone launch attempt this ready-window
 var droneShot int  // how many launches this game (cap)
 var walled [4]bool // CTF: four sides around our flag
@@ -70,6 +70,7 @@ func initMods() {
 	hasRadar = has_module("radar")
 	hasDrone = has_module("drone")
 	hasShield = has_module("shield")
+	hasBoost = has_module("boost")
 	modsReady = true
 }
 
@@ -415,14 +416,15 @@ func step(u *Unit, zigzag bool) {
 		return
 	}
 	u.stuck++
-	// Blocked: peel off along the other axis for a few ticks.
+	// Blocked: a few steps aside, then resume the same axis.
+	// Flipping horiz here glued raiders to a random row for the rest of the trip
+	// (wall at (91,48) sent a CTF rush along y=49).
 	altHoriz := want == Up || want == Down
 	u.detourDir = toward(ddx, ddy, altHoriz)
 	if u.detourDir == want || randInt(4) == 0 {
 		u.detourDir = (want + 1 + 2*randInt(2)) % 4
 	}
-	u.detour = 2 + randInt(4)
-	u.horiz = !u.horiz
+	u.detour = 3
 }
 
 func pickUnseen(u *Unit, lo, hi int) {
@@ -485,43 +487,51 @@ func enemyFlagCross() (ex, ey int, ok bool) {
 	return flagX, flagY, true
 }
 
-// Step off a known fire lane. Returns true if this tick was spent sidestepping.
-func sidestepLane(u *Unit) bool {
+// Jump the one cell of a fire lane. Boost lands two steps ahead, so the
+// bullet cell in between is skipped. Never boost along the stream.
+func crossLane() bool {
+	if !hasBoost || boost_ready() != 0 {
+		return false
+	}
+	what, dist := look_forward()
+	if what != "bullet" || dist != 1 {
+		return false
+	}
+	x, y := get_pos()
+	d := get_dir()
+	nx, ny := x+dx[d], y+dy[d]
+	ex, ey, known := enemyFlagCross()
+	across := false
+	if d == Left || d == Right {
+		// Moving sideways: only jump a column that sits on the next cell.
+		across = laneRow != y && (laneCol == nx || (known && nx == ex && x != ex))
+	} else {
+		across = laneCol != x && (laneRow == ny || (known && ny == ey && y != ey))
+	}
+	if !across {
+		return false
+	}
+	return boost()
+}
+
+// CTF raid: straight L-path to the camp. Nudge off a bullet stream, but
+// once close, commit — orbiting the cross lets Defender finish his walls.
+func ctfRaid(u *Unit, what string, dist int) {
+	noteBulletLane(what, dist)
+	if crossLane() {
+		return
+	}
 	x, y := get_pos()
 	g := get_grid_size()
 	ex, ey, known := enemyFlagCross()
-	hotRow := laneRow == y || (known && y == ey && abs(x-ex) > 3)
-	hotCol := laneCol == x || (known && x == ex && abs(y-ey) > 3)
-	if !hotRow && !hotCol {
-		return false
-	}
-	side := 2
-	if my_id()%2 == 0 {
-		side = -2
-	}
-	tx, ty := x, y
-	if hotRow {
-		ty = y + side
-	}
-	if hotCol {
-		tx = x + side
-	}
-	targetAt(u, clamp(tx, 1, g-2), clamp(ty, 1, g-2))
-	step(u, false)
-	return true
-}
+	close := known && abs(x-ex)+abs(y-ey) <= 5
 
-// CTF raid: reach the enemy camp on a diagonal, never ride a bullet row/col.
-func ctfRaid(u *Unit, what string, dist int) {
-	noteBulletLane(what, dist)
-	if what == "bullet" && dist <= 10 {
-		x, y := get_pos()
-		g := get_grid_size()
-		d := get_dir()
+	if !close && what == "bullet" && dist <= 8 {
 		side := 2
 		if my_id()%2 == 0 {
 			side = -2
 		}
+		d := get_dir()
 		tx, ty := x, y
 		if d == Left || d == Right {
 			ty = y + side
@@ -532,30 +542,21 @@ func ctfRaid(u *Unit, what string, dist int) {
 		step(u, false)
 		return
 	}
-	if sidestepLane(u) {
-		return
-	}
-	if ex, ey, ok := enemyFlagCross(); ok {
-		x, y := get_pos()
-		if abs(x-ex)+abs(y-ey) > 3 {
+	if known {
+		ax, ay := ex, ey
+		if !close {
+			// Final approach from a corner, not down the flag row/col.
 			ox, oy := 2, 2
 			if my_id()%2 == 0 {
-				ox = -2
+				ox, oy = -2, 2
 			}
-			g := get_grid_size()
-			ax, ay := clamp(ex+ox, 1, g-2), clamp(ey+oy, 1, g-2)
-			if ay == laneRow {
-				ay = clamp(ay+2, 1, g-2)
-			}
-			if ax == laneCol {
-				ax = clamp(ax+2, 1, g-2)
-			}
-			if u.tx != ax || u.ty != ay || u.budget <= 0 {
-				targetAt(u, ax, ay)
-			}
-			step(u, false)
-			return
+			ax, ay = clamp(ex+ox, 1, g-2), clamp(ey+oy, 1, g-2)
 		}
+		if u.tx != ax || u.ty != ay || u.budget <= 0 {
+			targetAt(u, ax, ay)
+		}
+		step(u, false)
+		return
 	}
 	search(u)
 }

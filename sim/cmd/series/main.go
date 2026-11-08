@@ -70,7 +70,7 @@ func main() {
 			seed, _ := strconv.Atoi(seedStr)
 			mods0 := engine.PlayerState{}
 			if *bot0 == "trisha" {
-				mods0 = engine.PlayerState{HasDrone: true, HasShield: true, HasRadar: true}
+				mods0 = engine.PlayerState{HasDrone: true, HasShield: true, HasRadar: true, HasBoost: true}
 			}
 			g, err := engine.NewGameFromPreview(pv, seed, false, mods0, engine.PlayerState{})
 			if err != nil {
