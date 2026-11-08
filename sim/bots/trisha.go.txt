@@ -621,12 +621,9 @@ func search(u *Unit) {
 }
 
 func holding() bool {
-	if alarm {
-		return false
-	}
-	// Break with Starter (~400), then stagger so the pack does not pour
-	// through one corridor into a knife-fight (xwHYgu8gDc).
-	return tick < dmHoldTicks+(my_id()%5)*18
+	// Leave together with Starter. Staggering by id sent the first warrior
+	// out alone into a full squad (Starter/Titan losses qvhWgDwtrG, a4LpCe8Rwe).
+	return !alarm && tick < dmHoldTicks
 }
 
 func dmHold(u *Unit) {
